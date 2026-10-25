@@ -258,6 +258,7 @@ proto.REASONS = {
   invalid_card  = "Unreadable card",
   no_response   = "Server did not respond",
   bad_signature = "Server signature invalid (check door key)",
+  lockdown      = "Access temporarily suspended by security lockdown",
 }
 
 function proto.fingerprint(cardId)
@@ -820,6 +821,7 @@ local state = {
   nonces = {},
   flash = nil,
   doorSeen = {},
+  lockdown = false,
 }
 local reader -- card reader (may be nil)
 
@@ -980,6 +982,10 @@ local function handleRequest(side, replyCh, req)
     return finish({ ok = false, reason = "bad_proof", name = "" }, card.name .. " (bad proof)")
   end
 
+  if state.lockdown then
+    return finish({ ok = false, reason = "lockdown", name = card.name }, card.name)
+  end
+
   local reason
   if card.disabled then reason = "disabled"
   elseif (card.expires or 0) ~= 0 and card.expires <= now then reason = "expired"
@@ -1005,6 +1011,101 @@ local function handleRequest(side, replyCh, req)
   end
 
   finish({ ok = true, name = card.name, uses = card.uses, exp = card.expires or 0 }, card.name)
+end
+
+------------------------------------------------------------------------
+-- Authenticated remote door controls
+------------------------------------------------------------------------
+local function controlMac(secret, doorId, action, ts, nonce, duration)
+  return sha2.hmac(secret, table.concat({
+    "ctl", doorId, action, tostring(ts), nonce, tostring(duration or 0)
+  }, "|"))
+end
+
+local function sendDoorControl(doorId, action, duration)
+  local door = state.db.doors[doorId]
+  if not door then return false, "Unknown door ID." end
+  if action ~= "unlock" and action ~= "lock" then return false, "Invalid door action." end
+  if action == "unlock" then
+    duration = duration or 5
+    if duration < 1 or duration > 30 then return false, "Unlock duration must be 1–30 seconds." end
+  else
+    duration = 0
+  end
+  local ts = math.floor(nowMs() / 1000)
+  local nonce = sha2.tohex(sha2.random(12))
+  local packet = {
+    p = proto.VERSION, t = "ctl", door = doorId, action = action,
+    ts = ts, nonce = nonce, duration = duration,
+  }
+  packet.mac = controlMac(door.secret, doorId, action, ts, nonce, duration)
+  local sent = 0
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "modem" then
+      local ok = pcall(peripheral.call, name, "transmit", CONFIG.channel, CONFIG.channel, packet)
+      if ok then sent = sent + 1 end
+    end
+  end
+  addLog { kind = "admin", text = "remote " .. action .. " command sent to '" .. doorId .. "'" }
+  flash("REMOTE " .. string.upper(action), doorId, action == "unlock" and colors.orange or colors.lime)
+  return sent > 0, sent > 0 and ("Command broadcast to " .. sent .. " modem(s).") or "No modem accepted the command."
+end
+
+local function setLockdown(enabled)
+  state.lockdown = enabled and true or false
+  addLog { kind = "admin", text = state.lockdown and "SECURITY LOCKDOWN ENABLED" or "Security lockdown disabled" }
+  flash(state.lockdown and "LOCKDOWN ACTIVE" or "LOCKDOWN CLEARED",
+    state.lockdown and "All card access is denied" or "Normal card access restored",
+    state.lockdown and colors.red or colors.lime)
+  dirty()
+end
+
+local function remoteControlMenu()
+  while true do
+    header("Remote door control")
+    print("Lockdown: " .. (state.lockdown and "ACTIVE" or "inactive"))
+    print("")
+    print("1) Remotely unlock a door (1–30 seconds)")
+    print("2) Remotely lock a door")
+    print("3) Enable global lockdown")
+    print("4) Clear global lockdown")
+    print("Q) Back")
+    local _, ch = os.pullEventRaw("char")
+    if ch == "q" or ch == "Q" then return
+    elseif ch == "1" or ch == "2" then
+      header(ch == "1" and "Remote unlock" or "Remote lock")
+      local ids = sortedDoorIds()
+      if #ids == 0 then print("No doors configured."); pause()
+      else
+        for i, id in ipairs(ids) do
+          local d = state.db.doors[id]
+          print(i .. ") " .. id .. (state.doorSeen[id] and (" | last seen " .. ui.duration((nowMs()-state.doorSeen[id])/1000) .. " ago") or " | not seen this session"))
+        end
+        write("Door number (Q cancels): ")
+        local raw = trim(read())
+        local idx = tonumber(raw)
+        if raw:lower() ~= "q" and idx and ids[idx] then
+          local duration = 5
+          if ch == "1" then
+            duration = tonumber(trim((function() write("Unlock duration (1–30 seconds): "); return read() end)()))
+            if not duration or duration < 1 or duration > 30 or duration ~= math.floor(duration) then
+              print("Invalid duration."); pause()
+            elseif confirm("Send remote UNLOCK to '" .. ids[idx] .. "' for " .. duration .. " seconds?") then
+              local ok, msg = sendDoorControl(ids[idx], "unlock", duration)
+              print(msg); pause()
+            end
+          elseif confirm("Send remote LOCK to '" .. ids[idx] .. "'?") then
+            local ok, msg = sendDoorControl(ids[idx], "lock")
+            print(msg); pause()
+          end
+        end
+      end
+    elseif ch == "3" then
+      if not state.lockdown and confirm("Enable GLOBAL lockdown? All valid card attempts will be denied.") then setLockdown(true) end
+    elseif ch == "4" then
+      if state.lockdown and confirm("Clear lockdown and restore normal card access?") then setLockdown(false) end
+    end
+  end
 end
 
 local function netLoop()
@@ -1034,7 +1135,12 @@ local function drawDash(t)
   ui.text(t, 2, 4, "Cards " .. #state.db.cards .. "  Doors " .. doorCount, colors.white)
   local stats = "Granted " .. state.granted .. "  Denied " .. state.denied
   ui.text(t, math.max(1, w - #stats), 4, stats, colors.lightGray)
-  ui.text(t, 1, 5, string.rep("-", w), colors.gray)
+  if state.lockdown then
+    ui.fill(t, 1, 5, w, 1, colors.red)
+    ui.center(t, 5, "LOCKDOWN ACTIVE - CARD ACCESS DENIED", colors.white, colors.red)
+  else
+    ui.text(t, 1, 5, string.rep("-", w), colors.gray)
+  end
 
   local rows = h - 5
   for i = 0, rows - 1 do
@@ -1043,13 +1149,13 @@ local function drawDash(t)
     local y = 6 + i
     ui.text(t, 2, y, os.date("%H:%M:%S", math.floor(e.t / 1000)), colors.lightGray)
     if e.kind == "access" then
-      ui.text(t, 11, y, e.ok and "OK" or "NO", e.ok and colors.lime or colors.red)
+      ui.text(t, 11, y, e.ok and "GRANT" or "DENY", e.ok and colors.lime or colors.red)
       local rest = (e.door or "?") .. "  " .. (e.who or "?")
       if e.reason then rest = rest .. "  [" .. e.reason .. "]" end
-      ui.text(t, 14, y, rest, colors.white)
+      ui.text(t, 18, y, rest, colors.white)
     else
-      ui.text(t, 11, y, "--", colors.yellow)
-      ui.text(t, 14, y, e.text or "", colors.lightGray)
+      ui.text(t, 11, y, e.text and "EVENT" or "--", colors.yellow)
+      ui.text(t, 18, y, e.text or "", colors.lightGray)
     end
   end
 
@@ -1492,6 +1598,7 @@ local function adminLoop()
   local actions = {
     ["1"] = enroll, ["2"] = function() showCardList(false) end, ["3"] = toggleSuspend,
     ["4"] = revokeCard, ["5"] = wipeCard, ["6"] = doorsMenu, ["7"] = viewLog, ["8"] = purgeDead,
+    ["9"] = remoteControlMenu,
   }
 
   while true do
@@ -1507,6 +1614,8 @@ local function adminLoop()
         print("6) Doors")
         print("7) Access log")
         print("8) Purge expired / used-up cards")
+        print("9) Remote control / lockdown")
+        if state.lockdown then print("SECURITY LOCKDOWN ACTIVE") end
         print("L) Lock now")
         print("")
         print("Reader: " .. (reader and reader:describe() or "none"))
@@ -1763,6 +1872,44 @@ local function main()
     setMode("checking")
   end
 
+  local controlSeen = {}
+  local function onControl(msg)
+    if type(msg) ~= "table" or msg.p ~= proto.VERSION or msg.t ~= "ctl"
+      or msg.door ~= CONFIG.doorId
+      or (msg.action ~= "unlock" and msg.action ~= "lock")
+      or type(msg.ts) ~= "number" or type(msg.nonce) ~= "string"
+      or #msg.nonce ~= 24 or type(msg.duration) ~= "number"
+      or type(msg.mac) ~= "string" then return end
+    local nowSec = math.floor(nowMs() / 1000)
+    if math.abs(nowSec - msg.ts) > 15 then return end
+    if controlSeen[msg.nonce] then return end
+    local expected = sha2.hmac(CONFIG.secret, table.concat({
+      "ctl", msg.door, msg.action, tostring(msg.ts), msg.nonce, tostring(msg.duration)
+    }, "|"))
+    if not sha2.equals(msg.mac, expected) then return end
+    controlSeen[msg.nonce] = nowSec
+    for nonce, seenAt in pairs(controlSeen) do
+      if nowSec - seenAt > 60 then controlSeen[nonce] = nil end
+    end
+
+    if msg.action == "lock" then
+      S.openUntil = 0
+      S.pending = nil
+      setDoor(false)
+      setMode("idle")
+      updateLamps()
+      beep(0, "bit", 8)
+      print("Remote lock command received.")
+    elseif msg.duration >= 1 and msg.duration <= 30 then
+      S.pending = nil
+      S.openUntil = nowMs() + msg.duration * 1000
+      setDoor(true)
+      setMode("granted", { name = "REMOTE CONTROL", uses = -1, exp = 0 })
+      updateLamps()
+      beep(0, "bit", 18); beep(120, "bit", 24)
+    end
+  end
+
   local function onModem(channel, msg)
     local p = S.pending
     if channel ~= replyChannel or not p then return end
@@ -1869,7 +2016,11 @@ local function main()
       tick = os.startTimer(0.1)
       onTick()
     elseif e == "modem_message" then
-      onModem(ev[3], ev[5])
+      if ev[3] == CONFIG.channel and type(ev[5]) == "table" and ev[5].t == "ctl" then
+        onControl(ev[5])
+      else
+        onModem(ev[3], ev[5])
+      end
     elseif e == "terminate" then
       -- Deliberately ignored; maintenance mode is the supported recovery path.
     elseif e == "char" and (ev[2] == "m" or ev[2] == "M") and S.mode == "idle" and not S.pending then
