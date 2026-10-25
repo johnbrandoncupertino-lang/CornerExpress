@@ -853,6 +853,7 @@ local function loadDb()
     if type(data.doors) ~= "table" then data.doors = {} end
     state.db = data
   end
+  state.lockdown = state.db.lockdown == true
   reindex()
 end
 
@@ -975,15 +976,15 @@ local function handleRequest(side, replyCh, req)
     return finish({ ok = false, reason = "stale" })
   end
 
+  if state.lockdown then
+    return finish({ ok = false, reason = "lockdown", name = "" })
+  end
+
   local card = state.byFp[req.fp]
   if not card then return finish({ ok = false, reason = "unknown_card" }) end
 
   if not proto.checkProof(req, door.secret, card.id) then
     return finish({ ok = false, reason = "bad_proof", name = "" }, card.name .. " (bad proof)")
-  end
-
-  if state.lockdown then
-    return finish({ ok = false, reason = "lockdown", name = card.name }, card.name)
   end
 
   local reason
@@ -1022,16 +1023,10 @@ local function controlMac(secret, doorId, action, ts, nonce, duration)
   }, "|"))
 end
 
-local function sendDoorControl(doorId, action, duration)
+local function broadcastControl(doorId, action, duration)
   local door = state.db.doors[doorId]
   if not door then return false, "Unknown door ID." end
-  if action ~= "unlock" and action ~= "lock" then return false, "Invalid door action." end
-  if action == "unlock" then
-    duration = duration or 5
-    if duration < 1 or duration > 30 then return false, "Unlock duration must be 1–30 seconds." end
-  else
-    duration = 0
-  end
+  duration = duration or 0
   local ts = math.floor(nowMs() / 1000)
   local nonce = sha2.tohex(sha2.random(12))
   local packet = {
@@ -1046,18 +1041,52 @@ local function sendDoorControl(doorId, action, duration)
       if ok then sent = sent + 1 end
     end
   end
-  addLog { kind = "admin", text = "remote " .. action .. " command sent to '" .. doorId .. "'" }
-  flash("REMOTE " .. string.upper(action), doorId, action == "unlock" and colors.orange or colors.lime)
   return sent > 0, sent > 0 and ("Command broadcast to " .. sent .. " modem(s).") or "No modem accepted the command."
 end
 
+local function sendDoorControl(doorId, action, duration)
+  if action ~= "unlock" and action ~= "lock" then return false, "Invalid door action." end
+  if action == "unlock" then
+    duration = duration or 5
+    if duration < 1 or duration > 30 or duration ~= math.floor(duration) then
+      return false, "Unlock duration must be a whole number from 1–30 seconds."
+    end
+  else
+    duration = 0
+  end
+  local ok, msg = broadcastControl(doorId, action, duration)
+  addLog { kind = "admin", text = "remote " .. action .. " command sent to '" .. doorId .. "'" }
+  flash("REMOTE " .. string.upper(action), doorId, action == "unlock" and colors.orange or colors.lime)
+  return ok, msg
+end
+
 local function setLockdown(enabled)
+  local previous = state.lockdown
+  local previousDb = state.db.lockdown
   state.lockdown = enabled and true or false
-  addLog { kind = "admin", text = state.lockdown and "SECURITY LOCKDOWN ENABLED" or "Security lockdown disabled" }
+  state.db.lockdown = state.lockdown
+  local saved, saveErr = pcall(saveDb)
+  if not saved then
+    state.lockdown = previous
+    state.db.lockdown = previousDb
+    addLog { kind = "admin", text = "LOCKDOWN CHANGE FAILED: database save error" }
+    flash("LOCKDOWN NOT CHANGED", "Could not persist security state", colors.red)
+    return false, tostring(saveErr)
+  end
+
+  local delivered = 0
+  for doorId in pairs(state.db.doors) do
+    local ok = broadcastControl(doorId, state.lockdown and "lockdown_on" or "lockdown_off", 0)
+    if ok then delivered = delivered + 1 end
+  end
+  addLog { kind = "admin", text = state.lockdown and
+    ("SECURITY LOCKDOWN ENABLED; signed command broadcast to " .. delivered .. " door(s)") or
+    ("Security lockdown disabled; signed command broadcast to " .. delivered .. " door(s)") }
   flash(state.lockdown and "LOCKDOWN ACTIVE" or "LOCKDOWN CLEARED",
-    state.lockdown and "All card access is denied" or "Normal card access restored",
+    state.lockdown and "All card access denied; doors commanded locked" or "Card access restored",
     state.lockdown and colors.red or colors.lime)
   dirty()
+  return true
 end
 
 local function remoteControlMenu()
@@ -1719,6 +1748,7 @@ local function main()
 
   local replyChannel = math.random(2000, 60000)
   modem.open(replyChannel)
+  modem.open(CONFIG.channel)
 
   local S = {
     mode = "idle",   -- idle | checking | granted | denied | error
@@ -1728,6 +1758,7 @@ local function main()
     openUntil = 0,
     frame = 0,
     sounds = {},
+    lockdown = false,
   }
 
   ------------------------------------------------------------------ hardware
@@ -1858,6 +1889,11 @@ local function main()
 
   local function onCard(id, handle, backend)
     reader:release(backend, handle) -- take the card back out immediately
+    if S.lockdown then
+      beep(0, "bit", 5)
+      setMode("denied", { reason = "lockdown" })
+      return
+    end
     if S.mode == "checking" then return end
 
     if id == false then
@@ -1876,7 +1912,7 @@ local function main()
   local function onControl(msg)
     if type(msg) ~= "table" or msg.p ~= proto.VERSION or msg.t ~= "ctl"
       or msg.door ~= CONFIG.doorId
-      or (msg.action ~= "unlock" and msg.action ~= "lock")
+      or (msg.action ~= "unlock" and msg.action ~= "lock" and msg.action ~= "lockdown_on" and msg.action ~= "lockdown_off")
       or type(msg.ts) ~= "number" or type(msg.nonce) ~= "string"
       or #msg.nonce ~= 24 or type(msg.duration) ~= "number"
       or type(msg.mac) ~= "string" then return end
@@ -1892,7 +1928,21 @@ local function main()
       if nowSec - seenAt > 60 then controlSeen[nonce] = nil end
     end
 
-    if msg.action == "lock" then
+    if msg.action == "lockdown_on" then
+      S.lockdown = true
+      S.openUntil = 0
+      S.pending = nil
+      setDoor(false)
+      setMode("denied", { reason = "lockdown" })
+      updateLamps()
+      beep(0, "bit", 5)
+    elseif msg.action == "lockdown_off" then
+      S.lockdown = false
+      S.openUntil = 0
+      setDoor(false)
+      setMode("idle")
+      updateLamps()
+    elseif msg.action == "lock" then
       S.openUntil = 0
       S.pending = nil
       setDoor(false)
@@ -1900,7 +1950,7 @@ local function main()
       updateLamps()
       beep(0, "bit", 8)
       print("Remote lock command received.")
-    elseif msg.duration >= 1 and msg.duration <= 30 then
+    elseif msg.action == "unlock" and not S.lockdown and msg.duration >= 1 and msg.duration <= 30 then
       S.pending = nil
       S.openUntil = nowMs() + msg.duration * 1000
       setDoor(true)
