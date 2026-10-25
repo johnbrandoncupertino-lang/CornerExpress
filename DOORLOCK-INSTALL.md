@@ -11,7 +11,7 @@ wget https://raw.githubusercontent.com/johnbrandoncupertino-lang/CornerExpress/m
 doorlock-installer
 ```
 
-Choose **Server / admin console** on the server computer. Choose **Door client** on each door computer. The installer writes the configured controller to `startup.lua`; it asks before replacing an existing startup file.
+Choose **Server / admin console** on the server computer, **Door client** on each door computer, or **MineLock pocket tablet** on a standard CC:Tweaked Pocket Computer. For a tablet, register it first from the server admin console under **Remote control / lockdown → Manage pocket tablets → Register tablet**, choose the allowed doors, and enter the generated tablet ID and secret in the installer. The installer writes the configured controller to `startup.lua`; it asks before replacing an existing startup file.
 
 ## Pair a client without copying a long key by hand
 
@@ -22,6 +22,12 @@ Choose **Server / admin console** on the server computer. Choose **Door client**
 5. The installer detects `doorpair.txt`, imports the door ID and secret, and offers to delete the pairing file.
 
 **Security:** `doorpair.txt` contains the door secret in plain text. Treat the floppy as a credential, keep it under your control, and delete the file after import. The installer also supports manual credential entry.
+
+## MineLock pocket tablet
+
+The tablet uses the same controller file with `ROLE = "tablet"`. Register each tablet on the server and grant access only to the doors it needs. The tablet secret is unique to that device; keep it private and revoke the tablet from the server if the credential is exposed. The current MVP supports authenticated discovery and manually confirmed remote lock/unlock requests. A successful tablet response means the server accepted and broadcast the command; it does **not** yet prove that the door received or executed it. Auto-open is not enabled until GPS coordinates or a compatible physical proximity sensor are configured and tested.
+
+The tablet requires a wireless modem and the same server channel as the door clients. It works on the standard pocket computer terminal without a monitor.
 
 ## Classic Peripherals NFC
 
