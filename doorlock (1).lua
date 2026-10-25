@@ -510,13 +510,9 @@ end
 
 function Nfc:release() end
 
--- NFC reads arrive as events, not synchronous peripheral methods. This cache
--- is only for diagnostics; callers that need a fresh tap must wait for poll().
+-- NFC readers do not expose a synchronous read method. Never return a
+-- cached swipe as if the card were still present; callers must wait for nfc_data.
 function Nfc:readId()
-  for _, name in ipairs(self.names) do
-    local id = self.lastRead[name]
-    if type(id) == "string" then return id end
-  end
   return nil
 end
 
