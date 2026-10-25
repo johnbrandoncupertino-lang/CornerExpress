@@ -1294,7 +1294,7 @@ local function doorsMenu()
       print(string.format("%-14s %-16s %s", id, (d.name or ""):sub(1, 16), seen))
     end
     print("")
-    print("1) Add door   2) Show door key   3) Remove door   Q) Back")
+    print("1) Add door   2) Show door key   3) Remove door   4) Export pairing file   Q) Back")
     local _, ch = os.pullEventRaw("char")
 
     if ch == "q" or ch == "Q" then return
@@ -1335,6 +1335,46 @@ local function doorsMenu()
         end
         pcall(saveDb)
         addLog { kind = "admin", text = "removed door '" .. id .. "'" }
+      end
+
+    elseif ch == "4" then
+      header("Export door pairing")
+      write("Door ID: ")
+      local id = trim(read())
+      local door = state.db.doors[id]
+      if not door then
+        print("Unknown door.")
+        pause()
+      else
+        local target
+        for _, side in ipairs(peripheral.getNames()) do
+          if peripheral.getType(side) == "drive" and disk.isPresent(side) and disk.hasData(side) then
+            target = side
+            break
+          end
+        end
+        local mount = target and disk.getMountPath(target)
+        if not mount then
+          print("Insert a writable floppy into a disk drive.")
+          pause()
+        else
+          print("WARNING: the pairing file contains the door secret in plain text.")
+          print("Keep the floppy secure and remove the file after installing the client.")
+          if confirm("Export pairing file for '" .. id .. "'?") then
+            local path = fs.combine(mount, "doorpair.txt")
+            local h = fs.open(path, "w")
+            if not h then
+              print("Could not write pairing file.")
+            else
+              h.writeLine(id)
+              h.writeLine(door.secret)
+              h.close()
+              pcall(disk.setLabel, target, "DOOR-PAIR")
+              print("Exported to doorpair.txt. Remove it after client setup.")
+            end
+            pause()
+          end
+        end
       end
     end
   end
@@ -1486,9 +1526,14 @@ end
 local ok, err = pcall(main)
 if not ok then
   printError(err)
-  sleep(5)
+  print("")
+  print("The server stopped safely. Press R to reboot, or Q to leave it stopped.")
+  while true do
+    local ev, ch = os.pullEventRaw()
+    if ev == "char" and (ch == "r" or ch == "R") then os.reboot() end
+    if ev == "char" and (ch == "q" or ch == "Q") then return end
+  end
 end
-os.reboot()
 
 end
 
@@ -1735,6 +1780,40 @@ local function main()
     drawDynamic()
   end
 
+  ------------------------------------------------------------------ maintenance
+  local function maintenanceMenu()
+    local t = term.current()
+    while true do
+      ui.clear(t, colors.black)
+      local w = t.getSize()
+      ui.fill(t, 1, 1, w, 1, colors.blue)
+      ui.text(t, 2, 1, "DOOR CONTROLLER | MAINTENANCE", colors.white, colors.blue)
+      print("")
+      print("Door ID: " .. CONFIG.doorId)
+      print("Reader(s): " .. reader:describe())
+      print("Modem: " .. (modem and "attached" or "missing"))
+      print("Reply channel: " .. tostring(replyChannel))
+      print("Server channel: " .. tostring(CONFIG.channel))
+      print("Redstone output: " .. tostring(CONFIG.redstoneSide))
+      print("Unlock duration: " .. tostring(CONFIG.openTime) .. "s")
+      print("Monitor: " .. (screen ~= term.current() and "attached" or "terminal only"))
+      print("")
+      print("R) Reboot controller")
+      print("Q) Return to access screen")
+      while true do
+        local ev, ch = os.pullEventRaw()
+        if ev == "char" and (ch == "q" or ch == "Q") then
+          screen = ui.findMonitor(CONFIG.monitor, CONFIG.monitorScale) or term.current()
+          setMode("idle")
+          return
+        elseif ev == "char" and (ch == "r" or ch == "R") then
+          setDoor(false)
+          os.reboot()
+        end
+      end
+    end
+  end
+
   ------------------------------------------------------------------ run
   setDoor(false)
   updateLamps()
@@ -1752,7 +1831,9 @@ local function main()
     elseif e == "modem_message" then
       onModem(ev[3], ev[5])
     elseif e == "terminate" then
-      -- ignored on purpose (door computers shouldn't be terminable)
+      -- Deliberately ignored; maintenance mode is the supported recovery path.
+    elseif e == "char" and (ev[2] == "m" or ev[2] == "M") and S.mode == "idle" and not S.pending then
+      maintenanceMenu()
     else
       local id, handle, backend = reader:poll(ev)
       if id ~= nil then onCard(id, handle, backend) end
@@ -1762,11 +1843,24 @@ end
 
 local ok, err = pcall(main)
 if not ok then
-  printError(err)
   pcall(redstone.setOutput, CONFIG.redstoneSide, CONFIG.defaultOutput)
-  sleep(5)
+  if CONFIG.lamps.granted then pcall(redstone.setOutput, CONFIG.lamps.granted, false) end
+  if CONFIG.lamps.denied then pcall(redstone.setOutput, CONFIG.lamps.denied, false) end
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.red)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("DOOR CONTROLLER STOPPED")
+  printError(err)
+  print("")
+  print("Door output forced to the configured locked state.")
+  print("Press R to reboot, or Q to leave it stopped.")
+  while true do
+    local ev, ch = os.pullEventRaw()
+    if ev == "char" and (ch == "r" or ch == "R") then os.reboot() end
+    if ev == "char" and (ch == "q" or ch == "Q") then return end
+  end
 end
-os.reboot()
 
 end
 
@@ -1798,7 +1892,7 @@ if found == 0 then
   print("Try: nfc_probe *")
 else
   print("")
-  print("Put the method names into cards.NFC_CFG (lib/cards.lua).")
+  print("Classic Peripherals NFC uses type nfc_reader and nfc_data/nfc_write events.")
 end
 
 end
