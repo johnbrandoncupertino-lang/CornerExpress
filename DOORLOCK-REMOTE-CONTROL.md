@@ -35,3 +35,14 @@ The server remains authoritative for card access. Clients that miss a broadcast 
 - Keep each door secret private. Anyone with that secret can forge control packets for that door.
 - Lockdown is persisted in `cards.db`; back up the database securely.
 - Test on a non-critical door first, including the redstone polarity and what happens if the modem network is interrupted.
+
+
+## MineLock pocket tablet
+
+The standard CC:Tweaked Pocket Computer can run the controller with `ROLE = "tablet"`. Register a tablet from the server's **Remote control / lockdown → Manage pocket tablets** menu and grant only the doors it should control. Each tablet receives a separate 32-character secret. The server authenticates requests, rejects replayed or stale requests, enforces per-door permissions, and denies tablet unlock requests during global lockdown.
+
+The tablet supports wireless discovery of its authorized doors, manual selection, and confirmation before remote unlock/lock. Unlock requests use a fixed five-second duration in this MVP. The tablet does not hold door secrets and cannot directly issue door-authenticated commands.
+
+**Status limitation:** the tablet currently reports that the server broadcast a command, not that a door acknowledged or physically changed state. A disconnected door may not execute the request. Auto-open is not enabled yet; wireless range alone is not a reliable physical-proximity measurement. The next stage is door acknowledgements/status plus a tested GPS or compatible sensor integration.
+
+To install, run the updated installer and choose **MineLock pocket tablet**. Register the device first on the server, then enter its tablet ID and secret. Revoke the tablet on the server immediately if the secret is exposed.
