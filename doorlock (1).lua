@@ -2341,6 +2341,13 @@ local function runTablet()
       "tablet_req", CONFIG.tabletId, action, doorId or "", tostring(ts), nonce
     }, "|"))
   end
+  local function tabletDoorsText(doors)
+    local out = {}
+    for i, door in ipairs(doors or {}) do
+      out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+    end
+    return table.concat(out, ";")
+  end
   local function resMac(packet)
     return sha2.hmac(CONFIG.secret, table.concat({
       "tablet_res", packet.device or "", packet.action or "", tostring(packet.ts or 0),
