@@ -824,7 +824,7 @@ local function nowMs() return os.epoch("utc") end
 local function dirty() os.queueEvent("lock_dirty") end
 
 local state = {
-  db = { version = 2, cards = {}, doors = {} },
+  db = { version = 2, cards = {}, doors = {}, tablets = {} },
   byFp = {},
   log = {},
   granted = 0,
@@ -1144,10 +1144,12 @@ end
 
 local function handleTabletRequest(side, replyCh, req)
   if type(replyCh) ~= "number" or type(req) ~= "table" or req.p ~= proto.VERSION
-    or req.t ~= "tablet_req" or type(req.device) ~= "string"
-    or type(req.action) ~= "string" or type(req.ts) ~= "number"
-    or type(req.nonce) ~= "string" or #req.nonce ~= 24
-    or not req.nonce:match("^[%x]+$") or type(req.mac) ~= "string" then return end
+    or req.t ~= "tablet_req" or type(req.device) ~= "string" or #req.device > 32
+    or not req.device:match("^[%w_%-]+$")
+    or (req.action ~= "discover" and req.action ~= "unlock" and req.action ~= "lock")
+    or type(req.ts) ~= "number" or type(req.nonce) ~= "string" or #req.nonce ~= 24
+    or not req.nonce:match("^[%x]+$") or type(req.mac) ~= "string"
+    or (req.door ~= nil and (type(req.door) ~= "string" or #req.door > 32)) then return end
 
   local tablet = state.db.tablets and state.db.tablets[req.device]
   if not tablet or tablet.disabled or type(tablet.secret) ~= "string" then return end
@@ -2369,7 +2371,13 @@ local function runTablet()
       local ev, a, b, c, d, e = os.pullEventRaw()
       if ev == "modem_message" and c == replyChannel and type(d) == "table"
         and d.t == "tablet_res" and d.device == CONFIG.tabletId and d.nonce == nonce then
-        if type(d.mac) ~= "string" or not sha2.equals(d.mac, resMac(d)) then
+        if type(d.action) ~= "string" or type(d.ts) ~= "number"
+          or type(d.nonce) ~= "string" or type(d.ok) ~= "boolean"
+          or type(d.message) ~= "string" or type(d.doors) ~= "table"
+          or type(d.lockdown) ~= "boolean" or type(d.mac) ~= "string" then
+          return nil, "The server response is malformed."
+        end
+        if not sha2.equals(d.mac, resMac(d)) then
           return nil, "The server response signature is invalid."
         end
         if math.abs(math.floor(os.epoch("utc") / 1000) - (d.ts or 0)) > 15 then
@@ -2388,7 +2396,6 @@ local function runTablet()
   local doors, selected = {}, 1
   local lockdown = false
   local lastMessage = "Choose Refresh to discover authorized doors."
-  local autoOpenEnabled = false
   local function draw()
     local t = term.current()
     local w, h = t.getSize()
@@ -2471,7 +2478,6 @@ local function runTablet()
       elseif ch == "u" then control("unlock")
       elseif ch == "l" then control("lock")
       elseif ch == "a" then
-        autoOpenEnabled = false
         lastMessage = "Auto-open is not enabled yet: configure GPS coordinates or a compatible physical sensor first."
         draw()
       end
