@@ -9,7 +9,7 @@
 -- Edit only the CONFIG blocks directly below. Everything after the line
 -- "END OF CONFIGURATION" is code and normally needs no changes.
 
-local ROLE = "client"   -- "server" | "client" | "nfc_probe"
+local ROLE = "client"   -- "server" | "client" | "tablet" | "nfc_probe"
 
 ------------------------------------------------------------------------
 -- SERVER CONFIG (used when ROLE = "server")
@@ -25,6 +25,7 @@ local SERVER_CONFIG = {
   maxLog        = 200,     -- entries kept in memory for the dashboard
   unlockSeconds = 120,     -- admin console auto-locks after this much inactivity
   nonceTTL      = 30,      -- seconds a request nonce is remembered (replay protection)
+  tabletNonceTTL = 60,     -- seconds tablet request nonces are remembered
 }
 
 ------------------------------------------------------------------------
@@ -47,6 +48,16 @@ local CLIENT_CONFIG = {
   monitorScale = 1,         -- text scale for the monitor
   channel      = 74,        -- must match the server
   timeout      = 3,         -- seconds to wait for the server
+}
+
+------------------------------------------------------------------------
+-- POCKET TABLET CONFIG (used when ROLE = "tablet")
+------------------------------------------------------------------------
+local TABLET_CONFIG = {
+  tabletId = "",             -- issued by the server administrator
+  secret   = "",             -- unique tablet secret; keep private
+  channel  = 74,             -- must match the server
+  timeout  = 3,              -- seconds to wait for server replies
 }
 
 ------------------------------------------------------------------------
@@ -819,6 +830,7 @@ local state = {
   granted = 0,
   denied = 0,
   nonces = {},
+  tabletNonces = {},
   flash = nil,
   doorSeen = {},
   lockdown = false,
@@ -851,8 +863,10 @@ local function loadDb()
       error("Could not parse " .. src .. " - repair or remove it (refusing to overwrite).", 0)
     end
     if type(data.doors) ~= "table" then data.doors = {} end
+    if type(data.tablets) ~= "table" then data.tablets = {} end
     state.db = data
   end
+  if type(state.db.tablets) ~= "table" then state.db.tablets = {} end
   state.lockdown = state.db.lockdown == true
   reindex()
 end
@@ -1089,6 +1103,192 @@ local function setLockdown(enabled)
   return true
 end
 
+
+------------------------------------------------------------------------
+-- Registered pocket-tablet protocol (server-authoritative)
+------------------------------------------------------------------------
+local function tabletRequestMac(secret, device, action, doorId, ts, nonce)
+  return sha2.hmac(secret, table.concat({
+    "tablet_req", device, action, doorId or "", tostring(ts), nonce
+  }, "|"))
+end
+
+local function tabletResponseMac(secret, packet)
+  return sha2.hmac(secret, table.concat({
+    "tablet_res", packet.device or "", packet.action or "", tostring(packet.ts or 0),
+    packet.nonce or "", packet.ok and "1" or "0", packet.message or "",
+    textutils.serialize(packet.doors or {}), packet.lockdown and "1" or "0"
+  }, "|"))
+end
+
+local function sendTabletResponse(side, replyCh, tablet, request, ok, message, doors)
+  local packet = {
+    p = proto.VERSION, t = "tablet_res", device = request.device,
+    action = request.action, nonce = request.nonce,
+    ts = math.floor(nowMs() / 1000), ok = ok and true or false,
+    message = message or "", doors = doors or {}, lockdown = state.lockdown,
+  }
+  packet.mac = tabletResponseMac(tablet.secret, packet)
+  pcall(peripheral.call, side, "transmit", replyCh, CONFIG.channel, packet)
+end
+
+local function handleTabletRequest(side, replyCh, req)
+  if type(replyCh) ~= "number" or type(req) ~= "table" or req.p ~= proto.VERSION
+    or req.t ~= "tablet_req" or type(req.device) ~= "string"
+    or type(req.action) ~= "string" or type(req.ts) ~= "number"
+    or type(req.nonce) ~= "string" or #req.nonce ~= 24
+    or not req.nonce:match("^[%x]+$") or type(req.mac) ~= "string" then return end
+
+  local tablet = state.db.tablets and state.db.tablets[req.device]
+  if not tablet or tablet.disabled or type(tablet.secret) ~= "string" then return end
+  local nowSec = math.floor(nowMs() / 1000)
+  if math.abs(nowSec - req.ts) > 15 then return end
+  local expected = tabletRequestMac(tablet.secret, req.device, req.action, req.door or "", req.ts, req.nonce)
+  if not sha2.equals(req.mac, expected) then
+    addLog { kind = "admin", text = "Rejected invalid tablet signature from '" .. req.device .. "'" }
+    return
+  end
+
+  local nonceKey = req.device .. ":" .. req.nonce
+  local cutoff = nowMs() - (CONFIG.tabletNonceTTL or 60) * 1000
+  for key, at in pairs(state.tabletNonces) do
+    if at < cutoff then state.tabletNonces[key] = nil end
+  end
+  if state.tabletNonces[nonceKey] then
+    sendTabletResponse(side, replyCh, tablet, req, false, "Duplicate request rejected.", {})
+    return
+  end
+  state.tabletNonces[nonceKey] = nowMs()
+
+  if req.action == "discover" then
+    local allowed = {}
+    for doorId, door in pairs(state.db.doors) do
+      if tablet.doors and tablet.doors[doorId] then
+        allowed[#allowed + 1] = { id = doorId, name = door.name or doorId }
+      end
+    end
+    table.sort(allowed, function(a, b) return a.id < b.id end)
+    sendTabletResponse(side, replyCh, tablet, req, true, "Discovery complete.", allowed)
+    return
+  end
+
+  if req.action ~= "unlock" and req.action ~= "lock" then
+    sendTabletResponse(side, replyCh, tablet, req, false, "Unsupported action.", {})
+    return
+  end
+
+  local doorId = req.door
+  local door = type(doorId) == "string" and state.db.doors[doorId] or nil
+  if not door or not tablet.doors or not tablet.doors[doorId] then
+    addLog { kind = "admin", text = "Tablet '" .. req.device .. "' denied access to door '" .. tostring(doorId or "?") .. "'" }
+    sendTabletResponse(side, replyCh, tablet, req, false, "This tablet is not authorized for that door.", {})
+    return
+  end
+  if req.action == "unlock" and state.lockdown then
+    addLog { kind = "admin", text = "Tablet unlock denied during lockdown: '" .. req.device .. "' -> '" .. doorId .. "'" }
+    sendTabletResponse(side, replyCh, tablet, req, false, "Global lockdown is active; unlocking is disabled.", {})
+    return
+  end
+
+  local duration = req.action == "unlock" and 5 or 0
+  local sent, message = broadcastControl(doorId, req.action, duration)
+  addLog { kind = "admin", text = "Tablet '" .. req.device .. "' requested " .. req.action .. " for door '" .. doorId .. "'" }
+  if sent then
+    sendTabletResponse(side, replyCh, tablet, req, true,
+      "Command broadcast. Door execution is not yet confirmed.", {})
+  else
+    sendTabletResponse(side, replyCh, tablet, req, false, message or "No modem accepted the command.", {})
+  end
+end
+
+local function tabletsMenu()
+  while true do
+    header("Pocket tablet management")
+    local ids = {}
+    for id in pairs(state.db.tablets or {}) do ids[#ids + 1] = id end
+    table.sort(ids)
+    if #ids == 0 then print("(no tablets registered)") end
+    for _, id in ipairs(ids) do
+      local tab = state.db.tablets[id]
+      local n = 0
+      for doorId in pairs(tab.doors or {}) do if state.db.doors[doorId] then n = n + 1 end end
+      print(id .. " | " .. (tab.disabled and "REVOKED" or "ACTIVE") .. " | " .. n .. " door(s)")
+    end
+    print("")
+    print("1) Register tablet")
+    print("2) Revoke tablet")
+    print("Q) Back")
+    local _, ch = os.pullEventRaw("char")
+    if ch == "q" or ch == "Q" then return
+    elseif ch == "1" then
+      header("Register pocket tablet")
+      local doorIds = sortedDoorIds()
+      if #doorIds == 0 then
+        print("Create at least one door before registering a tablet.")
+        pause()
+      else
+        print("Choose the doors this tablet may control.")
+        for i, id in ipairs(doorIds) do
+          print(i .. ") " .. id .. " | " .. (state.db.doors[id].name or id))
+        end
+        print("Enter door numbers separated by commas (for example 1,3).")
+        write("Authorized doors: ")
+        local raw = trim(read())
+        local grants = {}
+        local invalid = false
+        for token in raw:gmatch("[^,]+") do
+          local idx = tonumber(trim(token))
+          if not idx or idx ~= math.floor(idx) or not doorIds[idx] then invalid = true
+          else grants[doorIds[idx]] = true end
+        end
+        local count = 0
+        for _ in pairs(grants) do count = count + 1 end
+        if invalid or count == 0 then
+          print("No tablet created. Select at least one valid door number.")
+          pause()
+        else
+          local id = "tablet-" .. sha2.tohex(sha2.random(4))
+          while state.db.tablets[id] do id = "tablet-" .. sha2.tohex(sha2.random(4)) end
+          local secret = sha2.tohex(sha2.random(16))
+          state.db.tablets[id] = { secret = secret, doors = grants, disabled = false }
+          local saved, saveErr = pcall(saveDb)
+          if not saved then
+            state.db.tablets[id] = nil
+            print("Database save failed: " .. tostring(saveErr))
+          else
+            addLog { kind = "admin", text = "registered pocket tablet '" .. id .. "' with " .. count .. " authorized door(s)" }
+            print("")
+            print("Tablet registered. Configure TABLET_CONFIG with:")
+            print('  tabletId = "' .. id .. '"')
+            print('  secret = "' .. secret .. '"')
+            print("Keep the secret private. It is displayed only here; revoke and re-register if exposed.")
+          end
+          pause()
+        end
+      end
+    elseif ch == "2" then
+      header("Revoke pocket tablet")
+      write("Tablet ID: ")
+      local id = trim(read())
+      local tab = state.db.tablets[id]
+      if not tab then
+        print("Unknown tablet.")
+      elseif confirm("Revoke tablet '" .. id .. "'?") then
+        tab.disabled = true
+        local saved, saveErr = pcall(saveDb)
+        if not saved then
+          tab.disabled = false
+          print("Database save failed: " .. tostring(saveErr))
+        else
+          addLog { kind = "admin", text = "revoked pocket tablet '" .. id .. "'" }
+          print("Tablet revoked.")
+        end
+        pause()
+      end
+    end
+  end
+end
+
 local function remoteControlMenu()
   while true do
     header("Remote door control")
@@ -1098,6 +1298,7 @@ local function remoteControlMenu()
     print("2) Remotely lock a door")
     print("3) Enable global lockdown")
     print("4) Clear global lockdown")
+    print("5) Manage pocket tablets")
     print("Q) Back")
     local _, ch = os.pullEventRaw("char")
     if ch == "q" or ch == "Q" then return
@@ -1133,6 +1334,8 @@ local function remoteControlMenu()
       if not state.lockdown and confirm("Enable GLOBAL lockdown? All valid card attempts will be denied.") then setLockdown(true) end
     elseif ch == "4" then
       if state.lockdown and confirm("Clear lockdown and restore normal card access?") then setLockdown(false) end
+    elseif ch == "5" then
+      tabletsMenu()
     end
   end
 end
@@ -1141,7 +1344,8 @@ local function netLoop()
   while true do
     local _, side, ch, rch, msg = os.pullEventRaw("modem_message")
     if ch == CONFIG.channel then
-      local ok, err = pcall(handleRequest, side, rch, msg)
+      local handler = type(msg) == "table" and msg.t == "tablet_req" and handleTabletRequest or handleRequest
+      local ok, err = pcall(handler, side, rch, msg)
       if not ok then addLog { kind = "admin", text = "handler error: " .. tostring(err) } end
     end
   end
@@ -2100,6 +2304,166 @@ end
 
 end
 
+
+------------------------------------------------------------------------
+-- MineLock pocket tablet
+------------------------------------------------------------------------
+local function runTablet()
+  local CONFIG = TABLET_CONFIG
+  if CONFIG.tabletId == "" or CONFIG.secret == "" then
+    error("Register this tablet on the server and set TABLET_CONFIG.tabletId and TABLET_CONFIG.secret.", 0)
+  end
+  if #CONFIG.secret ~= 32 or not CONFIG.secret:match("^[%x]+$") then
+    error("TABLET_CONFIG.secret must be the 32-character hexadecimal secret issued by the server.", 0)
+  end
+  os.pullEvent = os.pullEventRaw
+  local sha2 = __require("lib.sha2")
+  local proto = __require("lib.proto")
+  sha2.selftest()
+  local modem = peripheral.find("modem")
+  if not modem then error("No modem attached.", 0) end
+  local replyChannel = math.random(2000, 60000)
+  modem.open(replyChannel)
+  modem.open(CONFIG.channel)
+
+  local function reqMac(action, doorId, ts, nonce)
+    return sha2.hmac(CONFIG.secret, table.concat({
+      "tablet_req", CONFIG.tabletId, action, doorId or "", tostring(ts), nonce
+    }, "|"))
+  end
+  local function resMac(packet)
+    return sha2.hmac(CONFIG.secret, table.concat({
+      "tablet_res", packet.device or "", packet.action or "", tostring(packet.ts or 0),
+      packet.nonce or "", packet.ok and "1" or "0", packet.message or "",
+      textutils.serialize(packet.doors or {}), packet.lockdown and "1" or "0"
+    }, "|"))
+  end
+  local function request(action, doorId)
+    local ts = math.floor(os.epoch("utc") / 1000)
+    local nonce = sha2.tohex(sha2.random(12))
+    local packet = {
+      p = proto.VERSION, t = "tablet_req", device = CONFIG.tabletId,
+      action = action, door = doorId or "", ts = ts, nonce = nonce,
+    }
+    packet.mac = reqMac(action, packet.door, ts, nonce)
+    modem.transmit(CONFIG.channel, replyChannel, packet)
+    local timer = os.startTimer(CONFIG.timeout or 3)
+    while true do
+      local ev, a, b, c, d, e = os.pullEventRaw()
+      if ev == "modem_message" and c == replyChannel and type(d) == "table"
+        and d.t == "tablet_res" and d.device == CONFIG.tabletId and d.nonce == nonce then
+        if type(d.mac) ~= "string" or not sha2.equals(d.mac, resMac(d)) then
+          return nil, "The server response signature is invalid."
+        end
+        if math.abs(math.floor(os.epoch("utc") / 1000) - (d.ts or 0)) > 15 then
+          return nil, "The server response is stale."
+        end
+        if not d.ok then return nil, d.message or "Request denied." end
+        return d
+      elseif ev == "timer" and a == timer then
+        return nil, "Server did not respond. Check connection and tablet pairing."
+      elseif ev == "terminate" then
+        -- Continue to fail-safe menu rather than terminate unexpectedly.
+      end
+    end
+  end
+
+  local doors, selected = {}, 1
+  local lockdown = false
+  local lastMessage = "Choose Refresh to discover authorized doors."
+  local autoOpenEnabled = false
+  local function draw()
+    local t = term.current()
+    local w, h = t.getSize()
+    ui.clear(t, colors.black)
+    ui.fill(t, 1, 1, w, 2, colors.blue)
+    ui.center(t, 1, "MINELOCK POCKET", colors.white, colors.blue)
+    ui.center(t, 2, CONFIG.tabletId, colors.lightBlue, colors.blue)
+    if lockdown then
+      ui.fill(t, 1, 3, w, 1, colors.red)
+      ui.center(t, 3, "GLOBAL LOCKDOWN", colors.white, colors.red)
+    else
+      ui.text(t, 2, 3, "Server channel " .. tostring(CONFIG.channel), colors.lightGray)
+    end
+    ui.text(t, 2, 4, "Authorized doors:", colors.white)
+    local visible = math.max(1, h - 11)
+    for i = 1, math.min(#doors, visible) do
+      local d = doors[i]
+      local y = 4 + i
+      local prefix = i == selected and "> " or "  "
+      ui.text(t, 2, y, prefix .. d.id .. " - " .. (d.name or d.id), i == selected and colors.lime or colors.white)
+    end
+    local actionsY = math.max(6, h - 6)
+    ui.fill(t, 1, actionsY, w, 1, colors.gray)
+    ui.text(t, 2, actionsY, "R Refresh  U Unlock  L Lock", colors.white, colors.gray)
+    ui.text(t, 2, actionsY + 1, "Up/Down Select  A Auto-open info  Q Quit", colors.lightGray)
+    ui.text(t, 2, h - 2, tostring(lastMessage):sub(1, math.max(1, w - 2)), colors.yellow)
+    ui.text(t, 2, h, "Manual control only | lockdown enforced", colors.gray)
+  end
+  local function refresh()
+    lastMessage = "Discovering authorized doors..."
+    draw()
+    local res, err = request("discover")
+    if not res then lastMessage = err
+    else
+      doors = res.doors or {}
+      lockdown = res.lockdown == true
+      selected = math.min(math.max(1, selected), math.max(1, #doors))
+      lastMessage = "Discovery complete: " .. #doors .. " authorized door(s)."
+    end
+    draw()
+  end
+  local function control(action)
+    local d = doors[selected]
+    if not d then lastMessage = "No door selected."; draw(); return end
+    if action == "unlock" and lockdown then
+      lastMessage = "Unlock blocked: global lockdown is active."
+      draw()
+      return
+    end
+    if action == "unlock" then
+      ui.clear(term.current(), colors.black)
+      print("Unlock door: " .. d.id)
+      print("This requests a 5-second unlock through the server.")
+      write("Confirm? (y/N): ")
+      local ch = read():lower()
+      if ch ~= "y" and ch ~= "yes" then lastMessage = "Unlock cancelled."; draw(); return end
+    else
+      ui.clear(term.current(), colors.black)
+      print("Lock door: " .. d.id)
+      write("Confirm lock? (y/N): ")
+      local ch = read():lower()
+      if ch ~= "y" and ch ~= "yes" then lastMessage = "Lock cancelled."; draw(); return end
+    end
+    local res, err = request(action, d.id)
+    lastMessage = res and res.message or err
+    if res then lockdown = res.lockdown == true end
+    draw()
+  end
+  refresh()
+  while true do
+    local ev, key = os.pullEventRaw()
+    if ev == "key" then
+      if key == keys.up then selected = math.max(1, selected - 1); draw()
+      elseif key == keys.down then selected = math.min(#doors, selected + 1); draw()
+      elseif key == keys.q then return end
+    elseif ev == "char" then
+      local ch = key:lower()
+      if ch == "q" then return
+      elseif ch == "r" then refresh()
+      elseif ch == "u" then control("unlock")
+      elseif ch == "l" then control("lock")
+      elseif ch == "a" then
+        autoOpenEnabled = false
+        lastMessage = "Auto-open is not enabled yet: configure GPS coordinates or a compatible physical sensor first."
+        draw()
+      end
+    elseif ev == "terminate" then
+      -- Keep the app in its explicit UI loop; Q exits.
+    end
+  end
+end
+
 local function runProbe(args)
 -- tools/nfc_probe.lua
 -- Lists attached peripherals whose type matches a substring (default "nfc")
@@ -2137,8 +2501,10 @@ if ROLE == "server" then
   runServer()
 elseif ROLE == "client" then
   runClient()
+elseif ROLE == "tablet" then
+  runTablet()
 elseif ROLE == "nfc_probe" then
   runProbe({ ... })
 else
-  error('doorlock.lua: set ROLE to "server", "client" or "nfc_probe"', 0)
+  error('doorlock.lua: set ROLE to "server", "client", "tablet" or "nfc_probe"', 0)
 end
