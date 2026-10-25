@@ -2335,6 +2335,7 @@ local function runTablet()
   os.pullEvent = os.pullEventRaw
   local sha2 = __require("lib.sha2")
   local proto = __require("lib.proto")
+  local ui = __require("lib.ui")
   sha2.selftest()
   local modem = peripheral.find("modem")
   if not modem then error("No modem attached.", 0) end
