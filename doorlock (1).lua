@@ -1104,6 +1104,8 @@ local function setLockdown(enabled)
 end
 
 
+local header, pause, confirm, trim
+
 ------------------------------------------------------------------------
 -- Registered pocket-tablet protocol (server-authoritative)
 ------------------------------------------------------------------------
@@ -1113,11 +1115,19 @@ local function tabletRequestMac(secret, device, action, doorId, ts, nonce)
   }, "|"))
 end
 
+local function tabletDoorsText(doors)
+  local out = {}
+  for i, door in ipairs(doors or {}) do
+    out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+  end
+  return table.concat(out, ";")
+end
+
 local function tabletResponseMac(secret, packet)
   return sha2.hmac(secret, table.concat({
     "tablet_res", packet.device or "", packet.action or "", tostring(packet.ts or 0),
     packet.nonce or "", packet.ok and "1" or "0", packet.message or "",
-    textutils.serialize(packet.doors or {}), packet.lockdown and "1" or "0"
+    tabletDoorsText(packet.doors), packet.lockdown and "1" or "0"
   }, "|"))
 end
 
@@ -1426,7 +1436,7 @@ end
 ------------------------------------------------------------------------
 -- Admin console (computer terminal)
 ------------------------------------------------------------------------
-local function header(title)
+header = function(title)
   local t = term.current()
   local w = t.getSize()
   ui.clear(t, colors.black)
@@ -1436,13 +1446,13 @@ local function header(title)
   t.setCursorPos(1, 3)
 end
 
-local function pause()
+pause = function()
   print("")
   print("Press any key...")
   os.pullEventRaw("key")
 end
 
-local function confirm(msg)
+confirm = function(msg)
   print(msg .. " (y/n)")
   while true do
     local _, ch = os.pullEventRaw("char")
@@ -1451,7 +1461,7 @@ local function confirm(msg)
   end
 end
 
-local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+trim = function(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
 
 local function cardStatus(c, now)
   if c.disabled then return "suspended", colors.gray end
@@ -2335,7 +2345,7 @@ local function runTablet()
     return sha2.hmac(CONFIG.secret, table.concat({
       "tablet_res", packet.device or "", packet.action or "", tostring(packet.ts or 0),
       packet.nonce or "", packet.ok and "1" or "0", packet.message or "",
-      textutils.serialize(packet.doors or {}), packet.lockdown and "1" or "0"
+      tabletDoorsText(packet.doors), packet.lockdown and "1" or "0"
     }, "|"))
   end
   local function request(action, doorId)
