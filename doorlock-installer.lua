@@ -87,7 +87,9 @@ if role == "server" then
   print("Choose a strong admin password. It is stored locally on this computer.")
   local password = ask("Admin password", nil, true)
   if #password < 8 then error("Use an admin password of at least 8 characters.", 0) end
-  source = source:gsub('adminPassword%s*=%s*""', 'adminPassword = ' .. quote(password), 1)
+  source = source:gsub('adminPassword%s*=%s*""', function()
+    return 'adminPassword = ' .. quote(password)
+  end, 1)
 else
   local id, secret, pairingPath = readPairingFile()
   if id and secret then
