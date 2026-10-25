@@ -463,108 +463,111 @@ function Disk:erase()
 end
 
 ------------------------------------------------------------------------
--- NFC backend  (NeoPeripherals: NFC Reader / NFC Master / NFC Card)
+-- Classic Peripherals NFC Reader (event-driven)
 --
--- WARNING: UNVERIFIED. I could confirm that NeoPeripherals provides an NFC
--- Master (read/write/lock), an NFC Reader (read) and a 1024-byte NFC Card,
--- but NOT the exact Lua method names or data format. Run
--- tools/nfc_probe.lua next to a reader, then adjust NFC_CFG below.
+-- Peripheral type: nfc_reader
+-- Read event:  nfc_data(event, side, cardDataString, cardPublicKeyString)
+-- Write event: nfc_write(event, side, successBoolean, reasonString)
+-- API: write(data, label, readonly, privateKey), cancelWrite()
+--
+-- Card payload remains CCL2:<32 hex chars>, so NFC and floppy cards share
+-- the same server-side authorization format. Public-key authentication is
+-- deliberately not required; the server remains the authority.
 ------------------------------------------------------------------------
 cards.NFC_CFG = {
-  typeMatch    = "nfc",   -- substring matched against peripheral type names
-  readMethod   = "read",  -- method returning the card's bytes (string or table)
-  writeMethod  = "write", -- method storing bytes on the card
-  writeAsTable = false,   -- true if write expects a table of byte values
-  pollInterval = 0.25,    -- seconds between reads while idle
+  peripheralType = "nfc_reader",
+  writeTimeout = 12,
 }
 
 local Nfc = {}
 Nfc.__index = Nfc
 
 function Nfc.new()
-  local cfg = cards.NFC_CFG
   local names = {}
   for _, name in ipairs(peripheral.getNames()) do
-    local ptype = peripheral.getType(name)
-    if ptype and ptype:lower():find(cfg.typeMatch, 1, true) then names[#names + 1] = name end
-  end
-  if #names == 0 then return nil, "no NFC peripheral attached" end
-  return setmetatable({ kind = "nfc", names = names, present = nil }, Nfc)
-end
-
-local function normalize(res)
-  if type(res) == "string" then return res end
-  if type(res) == "table" then
-    local out = {}
-    for i = 1, #res do
-      if type(res[i]) ~= "number" then return nil end
-      out[i] = string.char(res[i] % 256)
+    if peripheral.getType(name) == cards.NFC_CFG.peripheralType then
+      names[#names + 1] = name
     end
-    return table.concat(out)
   end
-  return nil
+  if #names == 0 then return nil, "no Classic Peripherals nfc_reader attached" end
+  local owned = {}
+  for _, name in ipairs(names) do owned[name] = true end
+  return setmetatable({ kind = "nfc", names = names, owned = owned, lastRead = {} }, Nfc)
 end
 
-function Nfc:rawRead(name)
-  local ok, res = pcall(peripheral.call, name, cards.NFC_CFG.readMethod)
-  if not ok then return nil, tostring(res) end
-  return normalize(res)
-end
-
-function Nfc:start()
-  if not self.timer then self.timer = os.startTimer(cards.NFC_CFG.pollInterval) end
-end
+function Nfc:start() end
 
 function Nfc:poll(ev)
-  if ev[1] ~= "timer" or ev[2] ~= self.timer then return nil end
-  self.timer = os.startTimer(cards.NFC_CFG.pollInterval)
-
-  for _, name in ipairs(self.names) do
-    local data = self:rawRead(name)
-    if data then
-      data = strip(data)
-      if #data > 0 then
-        local id = decode(data)
-        local key = id or "?"
-        if key ~= self.present then -- report each presentation once
-          self.present = key
-          return id or false, name
-        end
-        return nil
-      end
-    end
+  if ev[1] == "nfc_data" and self.owned[ev[2]] then
+    local name, payload = ev[2], ev[3]
+    local id = decode(payload)
+    self.lastRead[name] = id or false
+    if id then return id, name end
+    return false, name
   end
-  self.present = nil -- card removed
   return nil
 end
 
 function Nfc:release() end
 
+-- NFC reads arrive as events, not synchronous peripheral methods. This cache
+-- is only for diagnostics; callers that need a fresh tap must wait for poll().
 function Nfc:readId()
   for _, name in ipairs(self.names) do
-    local data = self:rawRead(name)
-    if data then
-      local id = decode(data)
-      if id then return id end
-    end
+    local id = self.lastRead[name]
+    if type(id) == "string" then return id end
   end
+  return nil
 end
 
-function Nfc:rawWrite(payload)
-  local cfg = cards.NFC_CFG
-  local arg = payload
-  if cfg.writeAsTable then arg = { payload:byte(1, -1) } end
-  local lastErr = "no NFC writer accepted the write"
+function Nfc:write(id, label)
+  local payload = encode(id)
+  local lastErr = "no NFC reader accepted the write"
   for _, name in ipairs(self.names) do
-    local ok, err = pcall(peripheral.call, name, cfg.writeMethod, arg)
-    if ok then return true end
+    local called, err = pcall(peripheral.call, name, "write", payload, label or "CCL2 Access Card", false, nil)
+    if called then
+      local timer = os.startTimer(cards.NFC_CFG.writeTimeout)
+      while true do
+        local ev, side, success, reason = os.pullEventRaw()
+        if ev == "nfc_write" and side == name then
+          if success then return true end
+          return false, (type(reason) == "string" and reason ~= "" and reason) or "NFC write failed"
+        elseif ev == "timer" and side == timer then
+          pcall(peripheral.call, name, "cancelWrite")
+          return false, "NFC write timed out; keep the card on the reader and retry"
+        elseif ev == "peripheral_detach" and side == name then
+          return false, "NFC reader detached during write"
+        end
+      end
+    end
     lastErr = tostring(err)
   end
   return false, lastErr
 end
 
-function Nfc:write(id) return self:rawWrite(encode(id)) end
-function Nfc:erase() return self:rawWrite("") end
+function Nfc:erase()
+  local lastErr = "no NFC reader accepted the erase"
+  for _, name in ipairs(self.names) do
+    local called, err = pcall(peripheral.call, name, "write", "", "Erased access card", false, nil)
+    if called then
+      local timer = os.startTimer(cards.NFC_CFG.writeTimeout)
+      while true do
+        local ev, side, success, reason = os.pullEventRaw()
+        if ev == "nfc_write" and side == name then
+          if success then return true end
+          return false, (type(reason) == "string" and reason ~= "" and reason) or "NFC erase failed"
+        elseif ev == "timer" and side == timer then
+          pcall(peripheral.call, name, "cancelWrite")
+          return false, "NFC erase timed out"
+        elseif ev == "peripheral_detach" and side == name then
+          return false, "NFC reader detached during erase"
+        end
+      end
+    end
+    lastErr = tostring(err)
+  end
+  return false, lastErr
+end
 
 ------------------------------------------------------------------------
 -- Composite
@@ -963,9 +966,10 @@ local function handleRequest(side, replyCh, req)
   card.useCount = (card.useCount or 0) + 1
 
   local saved = pcall(saveDb)
-  if not saved and decremented then
-    card.uses = card.uses + 1
-    card.useCount = card.useCount - 1
+  if not saved then
+    if decremented then card.uses = card.uses + 1 end
+    card.useCount = math.max(0, (card.useCount or 1) - 1)
+    card.lastUsed = nil
     return finish({ ok = false, reason = "server_error", name = card.name }, card.name)
   end
 
@@ -1183,38 +1187,43 @@ local function enroll()
   end
 
   print("")
-  print("Insert a card into the reader.  [Q] cancels.")
-  local id = cards.newId()
-  local tm = os.startTimer(0.5)
-  local overwriteOk = false
-  while true do
-    local existing = reader:readId()
-    if existing and not overwriteOk then
-      local owner = state.byFp[proto.fingerprint(existing)]
-      if owner then
-        print("This card is already enrolled as '" .. owner.name .. "'.")
-        if not confirm("Overwrite it? (the old entry will be deleted)") then return end
-        for i, c in ipairs(state.db.cards) do
-          if c == owner then table.remove(state.db.cards, i) break end
-        end
-        reindex()
-      end
-      overwriteOk = true
+  print("Present/insert a card at the reader.  [Q] cancels.")
+  local id, handle, backend
+  while handle == nil do
+    local ev = { os.pullEventRaw() }
+    if ev[1] == "char" and (ev[2] == "q" or ev[2] == "Q") then
+      print("Cancelled."); pause(); return
     end
+    local got, h, b = reader:poll(ev)
+    if got ~= nil and h ~= nil then
+      -- false means a blank or unreadable card was presented. It can still be
+      -- enrolled; only a valid existing CCL2 ID participates in overwrite checks.
+      id, handle, backend = got, h, b
+    end
+  end
 
-    local ok, err = reader:write(id, name)
-    if ok then break end
+  if type(id) == "string" then
+    local owner = state.byFp[proto.fingerprint(id)]
+    if owner then
+      print("This card is already enrolled as '" .. owner.name .. "'.")
+      if not confirm("Overwrite it? (the old entry will be deleted)") then return end
+      for i, c in ipairs(state.db.cards) do
+        if c == owner then table.remove(state.db.cards, i) break end
+      end
+      reindex()
+    end
+  end
 
-    local ev, p
-    repeat
-      ev, p = os.pullEventRaw()
-    until (ev == "timer" and p == tm) or ev == "disk" or ev == "char"
-    if ev == "timer" then tm = os.startTimer(0.5) end
-    if ev == "char" and (p == "q" or p == "Q") then print("Cancelled."); pause(); return end
+  local newId = cards.newId()
+  local written, writeErr = reader:write(newId, name)
+  if not written then
+    print("Card write failed: " .. tostring(writeErr))
+    pause()
+    return
   end
 
   local card = {
-    id = id, fp = proto.fingerprint(id), name = name,
+    id = newId, fp = proto.fingerprint(newId), name = name,
     created = nowMs(), expires = expires, uses = uses, doors = doors,
     useCount = 0, lastUsed = 0,
   }
