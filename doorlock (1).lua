@@ -845,12 +845,30 @@ end
 
 local function saveDb()
   local tmp = CONFIG.dbFile .. ".tmp"
+  local bak = CONFIG.dbFile .. ".bak"
   local h = fs.open(tmp, "w")
   if not h then error("cannot open " .. tmp .. " for writing", 0) end
-  h.write(textutils.serialize(state.db))
-  h.close()
-  if fs.exists(CONFIG.dbFile) then fs.delete(CONFIG.dbFile) end
-  fs.move(tmp, CONFIG.dbFile)
+  local ok, err = pcall(function()
+    h.write(textutils.serialize(state.db))
+    h.close()
+  end)
+  if not ok then
+    pcall(h.close)
+    error("could not write database temporary file: " .. tostring(err), 0)
+  end
+
+  -- Preserve the last known-good database until the new file is in place.
+  if fs.exists(bak) then fs.delete(bak) end
+  local hadOld = fs.exists(CONFIG.dbFile)
+  if hadOld then fs.move(CONFIG.dbFile, bak) end
+  local moved, moveErr = pcall(fs.move, tmp, CONFIG.dbFile)
+  if not moved then
+    if hadOld and fs.exists(bak) and not fs.exists(CONFIG.dbFile) then
+      pcall(fs.move, bak, CONFIG.dbFile)
+    end
+    error("could not replace database: " .. tostring(moveErr), 0)
+  end
+  if fs.exists(bak) then pcall(fs.delete, bak) end
 end
 
 local function sortedDoorIds()
@@ -961,15 +979,17 @@ local function handleRequest(side, replyCh, req)
   end
 
   local decremented = false
+  local previousLastUsed = card.lastUsed
+  local previousUseCount = card.useCount or 0
   if card.uses > 0 then card.uses = card.uses - 1; decremented = true end
   card.lastUsed = now
-  card.useCount = (card.useCount or 0) + 1
+  card.useCount = previousUseCount + 1
 
   local saved = pcall(saveDb)
   if not saved then
     if decremented then card.uses = card.uses + 1 end
-    card.useCount = math.max(0, (card.useCount or 1) - 1)
-    card.lastUsed = nil
+    card.useCount = previousUseCount
+    card.lastUsed = previousLastUsed
     return finish({ ok = false, reason = "server_error", name = card.name }, card.name)
   end
 
