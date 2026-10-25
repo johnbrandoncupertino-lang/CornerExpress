@@ -619,9 +619,24 @@ function Composite:readId()
   end
 end
 
-function Composite:write(id, label)
-  local lastErr = "no reader"
+function Composite:backendForReadId(id)
   for _, r in ipairs(self.readers) do
+    if r:readId() == id then return r end
+  end
+end
+
+local function orderedReaders(self, preferred)
+  local out = {}
+  if preferred then out[#out + 1] = preferred end
+  for _, r in ipairs(self.readers) do
+    if r ~= preferred then out[#out + 1] = r end
+  end
+  return out
+end
+
+function Composite:write(id, label, preferred)
+  local lastErr = "no reader"
+  for _, r in ipairs(orderedReaders(self, preferred)) do
     local ok, err = r:write(id, label)
     if ok then return true end
     lastErr = err
@@ -629,9 +644,9 @@ function Composite:write(id, label)
   return false, lastErr
 end
 
-function Composite:erase()
+function Composite:erase(preferred)
   local lastErr = "no reader"
-  for _, r in ipairs(self.readers) do
+  for _, r in ipairs(orderedReaders(self, preferred)) do
     local ok, err = r:erase()
     if ok then return true end
     lastErr = err
@@ -1235,7 +1250,7 @@ local function enroll()
   end
 
   local newId = cards.newId()
-  local written, writeErr = reader:write(newId, name)
+  local written, writeErr = reader:write(newId, name, backend)
   if not written then
     print("Card write failed: " .. tostring(writeErr))
     pause()
@@ -1287,13 +1302,14 @@ local function wipeCard()
   if not reader then print("No card reader attached."); pause(); return end
   print("Present/insert the card to erase. [Q] cancels.")
   local id = reader:readId()
+  local backend = id and reader:backendForReadId(id) or nil
   while id == nil do
     local ev = { os.pullEventRaw() }
     if ev[1] == "char" and (ev[2] == "q" or ev[2] == "Q") then
       print("Cancelled."); pause(); return
     end
-    local got = reader:poll(ev)
-    if got ~= nil then id = got end
+    local got, _, source = reader:poll(ev)
+    if got ~= nil then id, backend = got, source end
   end
   local owner = type(id) == "string" and state.byFp[proto.fingerprint(id)] or nil
   print(owner and ("Card belongs to '" .. owner.name .. "'.") or "Card is not in the database or is unreadable.")
@@ -1305,7 +1321,7 @@ local function wipeCard()
     reindex()
     pcall(saveDb)
   end
-  local ok, err = reader:erase()
+  local ok, err = reader:erase(backend)
   addLog { kind = "admin", text = "wiped card" .. (owner and (" '" .. owner.name .. "'") or "") }
   print(ok and "Card erased." or ("Could not erase card: " .. tostring(err)))
   pause()
