@@ -1265,11 +1265,19 @@ end
 local function wipeCard()
   header("Wipe card in reader")
   if not reader then print("No card reader attached."); pause(); return end
+  print("Present/insert the card to erase. [Q] cancels.")
   local id = reader:readId()
-  if not id then print("No enrolled card found in the reader."); pause(); return end
-  local owner = state.byFp[proto.fingerprint(id)]
-  print(owner and ("Card belongs to '" .. owner.name .. "'.") or "Card is not in the database.")
-  if not confirm("Erase this card and remove it from the database?") then return end
+  while id == nil do
+    local ev = { os.pullEventRaw() }
+    if ev[1] == "char" and (ev[2] == "q" or ev[2] == "Q") then
+      print("Cancelled."); pause(); return
+    end
+    local got = reader:poll(ev)
+    if got ~= nil then id = got end
+  end
+  local owner = type(id) == "string" and state.byFp[proto.fingerprint(id)] or nil
+  print(owner and ("Card belongs to '" .. owner.name .. "'.") or "Card is not in the database or is unreadable.")
+  if not confirm("Erase this physical card and remove any matching database entry?") then return end
   if owner then
     for i, c in ipairs(state.db.cards) do
       if c == owner then table.remove(state.db.cards, i) break end
