@@ -121,13 +121,19 @@ else
     source = source:gsub('doorId%s*=%s*""', 'doorId = ' .. quote(id), 1)
     source = source:gsub('secret%s*=%s*""', 'secret = ' .. quote(secret), 1)
   end
-  local side = ask("Redstone output side", "left")
+  local side = ask("Redstone output side (left/right/top/bottom/front/back)", "left"):lower()
+  local validSides = { left = true, right = true, top = true, bottom = true, front = true, back = true }
+  if not validSides[side] then error("Invalid redstone side.", 0) end
   local openTime = tonumber(ask("Unlock duration in seconds", "5"))
   if not openTime or openTime < 1 or openTime > 120 or openTime ~= math.floor(openTime) then
     error("Unlock duration must be a whole number from 1 to 120.", 0)
   end
-  source = source:gsub('redstoneSide%s*=%s*"left"', 'redstoneSide = ' .. quote(side), 1)
-  source = source:gsub('openTime%s*=%s*5', 'openTime = ' .. tostring(openTime), 1)
+  source = source:gsub('redstoneSide%s*=%s*"left"', function()
+    return 'redstoneSide = ' .. quote(side)
+  end, 1)
+  source = source:gsub('openTime%s*=%s*5', function()
+    return 'openTime = ' .. tostring(openTime)
+  end, 1)
 end
 
 local target = "startup.lua"
