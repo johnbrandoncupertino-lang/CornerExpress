@@ -75,7 +75,7 @@ print("2) Door client")
 print("3) MineLock pocket tablet")
 local role
 while not role do
-  local c = ask("Choose 1 or 2")
+  local c = ask("Choose 1, 2 or 3")
   if c == "1" then role = "server"
   elseif c == "2" then role = "client"
   elseif c == "3" then role = "tablet"
