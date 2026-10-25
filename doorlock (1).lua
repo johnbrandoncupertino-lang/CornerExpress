@@ -1889,11 +1889,6 @@ local function main()
 
   local function onCard(id, handle, backend)
     reader:release(backend, handle) -- take the card back out immediately
-    if S.lockdown then
-      beep(0, "bit", 5)
-      setMode("denied", { reason = "lockdown" })
-      return
-    end
     if S.mode == "checking" then return end
 
     if id == false then
@@ -1950,7 +1945,7 @@ local function main()
       updateLamps()
       beep(0, "bit", 8)
       print("Remote lock command received.")
-    elseif msg.action == "unlock" and not S.lockdown and msg.duration >= 1 and msg.duration <= 30 then
+    elseif msg.action == "unlock" and msg.duration >= 1 and msg.duration <= 30 then
       S.pending = nil
       S.openUntil = nowMs() + msg.duration * 1000
       setDoor(true)
