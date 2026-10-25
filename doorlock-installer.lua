@@ -72,12 +72,14 @@ print("")
 print("Install target:")
 print("1) Server / admin console")
 print("2) Door client")
+print("3) MineLock pocket tablet")
 local role
 while not role do
   local c = ask("Choose 1 or 2")
   if c == "1" then role = "server"
   elseif c == "2" then role = "client"
-  else print("Enter 1 or 2.") end
+  elseif c == "3" then role = "tablet"
+  else print("Enter 1, 2 or 3.") end
 end
 
 source = source:gsub('local ROLE = "[^"]+"', 'local ROLE = "' .. role .. '"', 1)
@@ -90,7 +92,7 @@ if role == "server" then
   source = source:gsub('adminPassword%s*=%s*""', function()
     return 'adminPassword = ' .. quote(password)
   end, 1)
-else
+elseif role == "client" then
   local id, secret, pairingPath = readPairingFile()
   if id and secret then
     print("")
@@ -134,6 +136,24 @@ else
   source = source:gsub('openTime%s*=%s*5', function()
     return 'openTime = ' .. tostring(openTime)
   end, 1)
+elseif role == "tablet" then
+  print("")
+  print("Register the tablet first using the server admin console:")
+  print("Remote control / lockdown > Manage pocket tablets > Register tablet.")
+  print("Enter the tablet ID and secret shown by the server.")
+  local id = ask("Tablet ID")
+  local secret = ask("Tablet secret", nil, true)
+  if not id:match("^[%w_%-]+$") or #id < 1 or #id > 32 then
+    error("Invalid tablet ID.", 0)
+  end
+  if #secret ~= 32 or not secret:match("^%x+$") then
+    error("Tablet secret must be the 32-character hexadecimal key issued by the server.", 0)
+  end
+  source = source:gsub('local TABLET_CONFIG = {.-}', function(block)
+    block = block:gsub('tabletId%s*=%s*""', 'tabletId = ' .. quote(id), 1)
+    block = block:gsub('secret%s*=%s*""', 'secret = ' .. quote(secret), 1)
+    return block
+  end, 1)
 end
 
 local target = "startup.lua"
@@ -155,6 +175,11 @@ fs.move(temp, target)
 print("")
 print("Installation complete: startup.lua")
 print("The controller starts automatically on the next boot.")
-print("Client maintenance menu: press M while the door is idle.")
-print("For a safe reboot, use M > R. Errors no longer trigger reboot loops.")
+if role == "client" then
+  print("Client maintenance menu: press M while the door is idle.")
+  print("For a safe reboot, use M > R. Errors no longer trigger reboot loops.")
+elseif role == "tablet" then
+  print("Tablet controls: R refresh, U unlock, L lock, A auto-open information, Q quit.")
+  print("Auto-open is not enabled in this MVP; remote commands are server-authorized.")
+end
 print("Keep exported pairing media secure; the secret is stored on the client.")
