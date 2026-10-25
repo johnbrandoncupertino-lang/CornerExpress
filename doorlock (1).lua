@@ -1118,7 +1118,11 @@ end
 local function tabletDoorsText(doors)
   local out = {}
   for i, door in ipairs(doors or {}) do
-    out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+    if type(door) == "table" then
+      out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+    else
+      out[i] = "\"invalid\""
+    end
   end
   return table.concat(out, ";")
 end
@@ -2346,7 +2350,11 @@ local function runTablet()
   local function tabletDoorsText(doors)
     local out = {}
     for i, door in ipairs(doors or {}) do
-      out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+      if type(door) == "table" then
+        out[i] = string.format("%q:%q", tostring(door.id or ""), tostring(door.name or ""))
+      else
+        out[i] = "\"invalid\""
+      end
     end
     return table.concat(out, ";")
   end
